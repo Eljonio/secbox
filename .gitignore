@@ -1,0 +1,12 @@
+# the safe itself and anything decrypted must never be committed
+.secrets/
+vault.age*
+vault.gpg*
+identity*
+staging.json
+unlocked.json
+
+__pycache__/
+*.py[cod]
+.env
+.env.*

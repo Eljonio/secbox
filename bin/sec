@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""sec — личный сейф секретов для работы рядом с ИИ-агентом.
+
+Сейф зашифрован на X25519-ключ (age). Сам ключ («личность») защищён одним из способов:
+  пароль       — личность лежит в ~/.secrets/identity.gpg под мастер-паролем
+  usb          — личность лежит на флешке; нет флешки — сейф не открыть, пароль не набирается
+  usb+pin      — флешка И короткий PIN (две независимые вещи)
+
+Мастер-пароль и PIN знает только владелец: спрашивает pinentry/zenity-окно или tty,
+никогда не передаётся аргументом (был бы виден в `ps`) и никогда не печатается.
+Расшифрованное живёт только в RAM (/dev/shm, 0600) и стирается по таймеру.
+
+  sec init [--usb] [--no-pin]    создать сейф
+  sec unlock [минут]             открыть доступ (по умолчанию 15)
+  sec lock                       закрыть и стереть расшифрованное
+  sec status                     режим, заперт/открыт, сколько осталось
+  sec ls [фильтр]                имена ключей (без значений)
+  sec show <ключ>                источник и длина — БЕЗ значения
+  sec cp <ключ>                  значение в буфер обмена, минуя экран        ← предпочитать
+  sec env VAR=ключ [..] -- cmd   запустить команду с секретом в переменной    ← предпочитать
+  sec ssh <ключ> user@host [..]  ssh через sshpass, пароль не печатается      ← предпочитать
+  sec get <ключ>                 напечатать значение (осознанно!)
+  sec add <ключ> [--note текст]  добавить (значение вводится скрытно)
+  sec rm <ключ> | sec rename <старый> <новый>
+  sec passwd                     сменить мастер-пароль / PIN
+  sec recover                    восстановить доступ по резервному паролю (потеряна флешка)
+  sec export <файл>              расшифровать в файл (осознанно, 0600)
+  sec sources                    какие файлы на диске ещё содержат эти же секреты
+"""
+import getpass, json, os, re, shutil, subprocess, sys, time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+UID = os.getuid()
+SEC_DIR = HOME / ".secrets"
+VAULT = SEC_DIR / "vault.age"
+CONF = SEC_DIR / "config.json"
+IDENT_PASS = SEC_DIR / "identity.gpg"            # режим «пароль»
+IDENT_RECOVERY = SEC_DIR / "identity-recovery.gpg"  # запасной выход для usb-режимов
+CATALOG = SEC_DIR / "catalog"                    # ТОЛЬКО имена ключей
+RAM_DIR = Path(os.environ.get("SECBOX_RAM_DIR") or f"/dev/shm/secbox-{UID}")  # переопределяется в тестах
+UNLOCKED = RAM_DIR / "unlocked.json"
+EXPIRES = RAM_DIR / "expires"
+STAGING = RAM_DIR / "staging.json"
+DEFAULT_MIN = 15
+USB_REL = "secbox/identity"
+
+GPG = ["gpg", "--batch", "--yes", "--quiet", "--pinentry-mode", "loopback"]
+GPG_ENC = GPG + ["--symmetric", "--cipher-algo", "AES256",
+                 "--s2k-mode", "3", "--s2k-count", "65011712", "--s2k-digest-algo", "SHA512"]
+
+
+# ---------- мелочи ----------
+def die(msg, code=1):
+    print(f"sec: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def ok(msg):
+    print(f"✓ {msg}")
+
+
+def ensure_dirs():
+    SEC_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(SEC_DIR, 0o700)
+    RAM_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(RAM_DIR, 0o700)
+
+
+def write_private(path: Path, data):
+    mode = "wb" if isinstance(data, bytes) else "w"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, mode) as f:
+        f.write(data)
+
+
+def shred(path: Path):
+    """Затереть и удалить. В tmpfs это RAM, на флешке — best effort."""
+    try:
+        if not path.exists():
+            return
+        n = path.stat().st_size
+        with open(path, "r+b") as f:
+            for _ in range(2):
+                f.seek(0)
+                f.write(os.urandom(n))
+                f.flush()
+                os.fsync(f.fileno())
+        path.unlink()
+    except OSError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def ask_pass(prompt: str, confirm: bool = False, min_len: int = 0) -> str:
+    """Секрет от владельца. pinentry (делает X-grab) → zenity → tty. Через Claude не проходит."""
+    pe = shutil.which("pinentry-gnome3") or shutil.which("pinentry")
+
+    def via_pinentry(text):
+        script = f"SETTITLE secbox\nSETDESC {text}\nSETPROMPT Ввод:\nGETPIN\nBYE\n"
+        r = subprocess.run([pe], input=script, capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            if line.startswith("D "):
+                return line[2:]
+        return None
+
+    p = None
+    if pe and os.environ.get("DISPLAY"):
+        p = via_pinentry(prompt)
+        if p is not None and confirm and via_pinentry(prompt + " — ещё раз") != p:
+            die("не совпало")
+    if p is None and os.environ.get("DISPLAY") and shutil.which("zenity"):
+        def z(t):
+            r = subprocess.run(["zenity", "--password", "--title", t], capture_output=True, text=True)
+            if r.returncode != 0:
+                die("отменено")
+            return r.stdout.rstrip("\n")
+        p = z(prompt)
+        if confirm and z(prompt + " — ещё раз") != p:
+            die("не совпало")
+    if p is None:
+        try:
+            open("/dev/tty").close()
+        except OSError:
+            die("нет ни GUI, ни терминала — запусти команду в своём терминале")
+        p = getpass.getpass(prompt + ": ")
+        if confirm and getpass.getpass("ещё раз: ") != p:
+            die("не совпало")
+    if not p:
+        die("пусто")
+    if confirm and min_len and len(p) < min_len:
+        print(f"⚠ короче {min_len} символов. Для мастер-пароля нужны 4+ случайных слова.", file=sys.stderr)
+    return p
+
+
+def run_pipe(args, passphrase, data: bytes) -> bytes:
+    """Пароль уходит отдельным pipe — не через argv (иначе виден в ps)."""
+    r, w = os.pipe()
+    os.write(w, (passphrase + "\n").encode())
+    os.close(w)
+    try:
+        p = subprocess.run(args + ["--passphrase-fd", str(r)], input=data,
+                           capture_output=True, pass_fds=(r,))
+    finally:
+        try:
+            os.close(r)
+        except OSError:
+            pass
+    if p.returncode != 0:
+        err = [l for l in p.stderr.decode("utf-8", "ignore").splitlines() if l.strip()]
+        die("gpg: " + (err[-1] if err else "ошибка (неверный пароль?)"))
+    return p.stdout
+
+
+def gpg_seal(plain: bytes, passphrase: str) -> bytes:
+    return run_pipe(GPG_ENC, passphrase, plain)
+
+
+def gpg_open(blob: bytes, passphrase: str) -> bytes:
+    return run_pipe(GPG + ["--decrypt"], passphrase, blob)
+
+
+# ---------- age ----------
+def age_bin():
+    a = shutil.which("age")
+    if not a:
+        die("нет age (sudo apt install age)")
+    return a
+
+
+def age_keygen():
+    kg = shutil.which("age-keygen")
+    if kg:
+        r = subprocess.run([kg], capture_output=True, text=True)
+    else:
+        r = subprocess.run([age_bin(), "-keygen"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die("не смог сгенерировать ключ age")
+    out = r.stdout + r.stderr
+    sk = next((l.strip() for l in out.splitlines() if l.startswith("AGE-SECRET-KEY-")), None)
+    pk = next((l.split(":", 1)[1].strip() for l in out.splitlines() if "public key:" in l), None)
+    if not sk or not pk:
+        die("не разобрал вывод age-keygen")
+    return sk, pk
+
+
+def age_encrypt(plain: bytes, recipient: str) -> bytes:
+    p = subprocess.run([age_bin(), "-r", recipient], input=plain, capture_output=True)
+    if p.returncode != 0:
+        die("age: " + p.stderr.decode("utf-8", "ignore").strip())
+    return p.stdout
+
+
+def age_decrypt(blob: bytes, identity_file: Path) -> bytes:
+    p = subprocess.run([age_bin(), "-d", "-i", str(identity_file)], input=blob, capture_output=True)
+    if p.returncode != 0:
+        die("age: " + p.stderr.decode("utf-8", "ignore").strip())
+    return p.stdout
+
+
+# ---------- конфиг и флешка ----------
+def conf_load() -> dict:
+    if not CONF.exists():
+        die("сейфа нет — сначала `sec init`")
+    return json.loads(CONF.read_text())
+
+
+def conf_save(c: dict):
+    write_private(CONF, json.dumps(c, ensure_ascii=False, indent=1))
+
+
+def removable():
+    """Список примонтированных съёмных носителей: (uuid, mountpoint, label, size)."""
+    r = subprocess.run(["lsblk", "-rno", "UUID,MOUNTPOINT,LABEL,SIZE,RM,TYPE"],
+                       capture_output=True, text=True)
+    out = []
+    for line in r.stdout.splitlines():
+        f = line.split(" ")
+        if len(f) < 6:
+            continue
+        uuid, mnt, label, size, rm, typ = f[0], f[1], f[2], f[3], f[4], f[5]
+        if rm == "1" and typ == "part" and mnt and uuid:
+            out.append((uuid, mnt.replace("\\x20", " "), label, size))
+    return out
+
+
+def find_usb(uuid: str):
+    for u, mnt, _, _ in removable():
+        if u == uuid:
+            return Path(mnt)
+    return None
+
+
+def identity_to_ram(c: dict) -> Path:
+    """Достаём личность в RAM. Возвращает путь к временному файлу (его потом shred)."""
+    ensure_dirs()
+    tmp = RAM_DIR / "id.tmp"
+    mode = c["mode"]
+    if mode == "pass":
+        blob = IDENT_PASS.read_bytes()
+        pw = ask_pass("Мастер-пароль сейфа")
+        write_private(tmp, gpg_open(blob, pw))
+        return tmp
+    mnt = find_usb(c["usb_uuid"])
+    if not mnt:
+        die(f"флешка не найдена (UUID {c['usb_uuid'][:8]}…). Воткни её и примонтируй.\n"
+            f"    Потеряна безвозвратно → sec recover")
+    if mode == "usb":
+        src = mnt / (USB_REL + ".key")
+        if not src.exists():
+            die(f"на флешке нет {src}")
+        write_private(tmp, src.read_bytes())
+        return tmp
+    if mode == "usb+pin":
+        src = mnt / (USB_REL + ".gpg")
+        if not src.exists():
+            die(f"на флешке нет {src}")
+        pin = ask_pass("PIN сейфа")
+        write_private(tmp, gpg_open(src.read_bytes(), pin))
+        return tmp
+    die(f"неизвестный режим {mode}")
+
+
+# ---------- сейф ----------
+def load_locked(c=None) -> tuple:
+    c = c or conf_load()
+    idf = identity_to_ram(c)
+    try:
+        data = json.loads(age_decrypt(VAULT.read_bytes(), idf).decode())
+    finally:
+        shred(idf)
+    return data, c
+
+
+def save_locked(data: dict, c: dict):
+    blob = age_encrypt(json.dumps(data, ensure_ascii=False, indent=1).encode(), c["recipient"])
+    tmp = SEC_DIR / "vault.age.new"
+    write_private(tmp, blob)
+    if VAULT.exists():
+        shutil.copy2(VAULT, SEC_DIR / "vault.age.bak")
+        os.chmod(SEC_DIR / "vault.age.bak", 0o600)
+    tmp.replace(VAULT)
+    os.chmod(VAULT, 0o600)
+    write_private(CATALOG, "\n".join(sorted(data)) + "\n")
+
+
+def unlocked_alive() -> bool:
+    if not UNLOCKED.exists() or not EXPIRES.exists():
+        return False
+    try:
+        if time.time() > float(EXPIRES.read_text().strip()):
+            do_lock(quiet=True)
+            return False
+    except ValueError:
+        return False
+    return True
+
+
+def load_unlocked() -> dict:
+    if not unlocked_alive():
+        die("сейф заперт. Открой: sec unlock")
+    return json.loads(UNLOCKED.read_text())
+
+
+def need(data: dict, key: str) -> str:
+    if key in data:
+        return data[key]["value"]
+    near = [k for k in data if key.lower() in k.lower()]
+    if len(near) == 1:
+        return data[near[0]]["value"]
+    if near:
+        die("уточни, подходит несколько: " + ", ".join(sorted(near)[:10]))
+    die(f"нет ключа «{key}». Смотри: sec ls")
+
+
+# ---------- команды ----------
+def cmd_init(args):
+    ensure_dirs()
+    if VAULT.exists() and "--force" not in args:
+        die("сейф уже есть. Добавить ключ: sec add | пересоздать: sec init --force")
+    use_usb = "--usb" in args
+    use_pin = use_usb and "--no-pin" not in args
+
+    usb_uuid = usb_mnt = None
+    if use_usb:
+        devs = removable()
+        if not devs:
+            die("не вижу примонтированных съёмных носителей. Воткни флешку, открой её в файловом\n"
+                "    менеджере (чтобы примонтировалась) и повтори. Без флешки: sec init")
+        print("Съёмные носители:")
+        for i, (u, mnt, label, size) in enumerate(devs, 1):
+            print(f"  {i}) {size:>8}  {label or '(без метки)':<16} {mnt}")
+        pick = input(f"Номер флешки под ключ [1-{len(devs)}]: ").strip() or "1"
+        if not pick.isdigit() or not 1 <= int(pick) <= len(devs):
+            die("не понял выбор")
+        usb_uuid, usb_mnt = devs[int(pick) - 1][0], Path(devs[int(pick) - 1][1])
+
+    # находки сканера → ключи
+    entries = {}
+    src = Path(args[args.index("--from") + 1]) if "--from" in args else STAGING
+    if src.exists():
+        for h in json.loads(src.read_text()):
+            base = re.sub(r"[^a-z0-9]+", "_", Path(h["file"]).stem.lower()).strip("_")
+            base = re.sub(r"^(project|reference|feedback|user)_", "", base)
+            key = f"{base}.{h['key']}"[:80]
+            i = 2
+            while key in entries and entries[key]["value"] != h["value"]:
+                key = f"{base}.{h['key']}_{i}"[:80]
+                i += 1
+            entries[key] = {"value": h["value"], "source": f"{h['file']}:{h['line']}",
+                            "context": h.get("context", ""),
+                            "added": datetime.now().isoformat(timespec="seconds")}
+        print(f"\nИз находок сканера: {len(entries)} ключей")
+    else:
+        print("\nСтаг-файла нет — создаю пустой сейф (наполнять через `sec add`)")
+
+    sk, pk = age_keygen()
+    print("\nСейчас будут запрошены пароли. Их не видит и не хранит никто, включая Claude.")
+
+    if use_usb:
+        tgt = usb_mnt / USB_REL
+        tgt.parent.mkdir(parents=True, exist_ok=True)
+        if use_pin:
+            pin = ask_pass("Придумай PIN (он защитит ключ на флешке)", confirm=True)
+            write_private(tgt.with_suffix(".gpg"), gpg_seal(sk.encode(), pin))
+            mode = "usb+pin"
+        else:
+            write_private(tgt.with_suffix(".key"), sk)
+            mode = "usb"
+        print("\nЗапасной выход на случай потери флешки — длинный пароль (4+ случайных слова).")
+        print("Он нужен только в аварии, каждый день вводить не придётся.")
+        rec = ask_pass("Резервный пароль", confirm=True, min_len=12)
+        write_private(IDENT_RECOVERY, gpg_seal(sk.encode(), rec))
+    else:
+        pw = ask_pass("Мастер-пароль сейфа (4+ случайных слова)", confirm=True, min_len=12)
+        write_private(IDENT_PASS, gpg_seal(sk.encode(), pw))
+        mode = "pass"
+
+    c = {"mode": mode, "recipient": pk, "usb_uuid": usb_uuid,
+         "created": datetime.now().isoformat(timespec="seconds")}
+    conf_save(c)
+    save_locked(entries, c)
+    shred(src)
+    ok(f"сейф создан: {VAULT} ({len(entries)} ключей), режим «{mode}»")
+    if use_usb:
+        print(f"  ключ на флешке:  {usb_mnt / USB_REL}{'.gpg' if use_pin else '.key'}")
+        print(f"  вынул флешку — сейф не открыть ничем, кроме резервного пароля")
+    print(f"  имена ключей:    {CATALOG}")
+    print(f"  открыть:         sec unlock 15")
+    print(f"  что ещё открыто: sec sources")
+
+
+def cmd_unlock(args):
+    ensure_dirs()
+    mins = next((max(1, min(int(a), 480)) for a in args if a.isdigit()), DEFAULT_MIN)
+    data, _ = load_locked()
+    write_private(UNLOCKED, json.dumps(data, ensure_ascii=False))
+    write_private(EXPIRES, str(time.time() + mins * 60))
+    # stdin тоже отвязываем: иначе таймер держит терминал открытым до самого срабатывания
+    subprocess.Popen([sys.executable, __file__, "_reaper", str(mins * 60)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    ok(f"открыто на {mins} мин, ключей: {len(data)} (закрыть сейчас: sec lock)")
+
+
+def cmd_reaper(args):
+    time.sleep(float(args[0]) if args else DEFAULT_MIN * 60)
+    try:
+        if EXPIRES.exists() and time.time() >= float(EXPIRES.read_text().strip()) - 1:
+            do_lock(quiet=True)
+    except (ValueError, OSError):
+        do_lock(quiet=True)
+
+
+def do_lock(quiet=False):
+    shred(UNLOCKED)
+    shred(EXPIRES)
+    shred(RAM_DIR / "id.tmp")
+    if not quiet:
+        ok("заперто, расшифрованное стёрто из памяти")
+
+
+def cmd_lock(args):
+    do_lock()
+
+
+def cmd_status(args):
+    if not CONF.exists():
+        print("сейф:    НЕТ (sec init)")
+        return
+    c = conf_load()
+    print(f"режим:   {c['mode']}")
+    if c["mode"].startswith("usb"):
+        mnt = find_usb(c["usb_uuid"])
+        print(f"флешка:  {'воткнута → ' + str(mnt) if mnt else 'НЕ воткнута (открыть нельзя)'}")
+    st = VAULT.stat()
+    print(f"сейф:    {VAULT} — {st.st_size} байт, права {oct(st.st_mode)[-3:]}, "
+          f"изменён {datetime.fromtimestamp(st.st_mtime):%d.%m.%Y %H:%M}")
+    if unlocked_alive():
+        left = float(EXPIRES.read_text().strip()) - time.time()
+        print(f"доступ:  ОТКРЫТ, осталось {int(left // 60)} мин {int(left % 60)} с")
+        print(f"ключей:  {len(json.loads(UNLOCKED.read_text()))}")
+    else:
+        print("доступ:  заперт")
+        if CATALOG.exists():
+            print(f"ключей:  {len(CATALOG.read_text().split())} (имена в {CATALOG})")
+
+
+def cmd_ls(args):
+    flt = (args[0].lower() if args and not args[0].startswith("-") else "")
+    if unlocked_alive():
+        data = load_unlocked()
+        rows = [(k, v.get("source", "")) for k, v in sorted(data.items()) if flt in k.lower()]
+        for k, s in rows:
+            print(f"{k:<52} {s.replace(str(HOME), '~')[:60]}")
+        print(f"\n{len(rows)} ключей")
+    elif CATALOG.exists():
+        names = [n for n in CATALOG.read_text().split() if flt in n.lower()]
+        print("\n".join(names))
+        print(f"\n{len(names)} ключей (заперто — только имена; значения: sec unlock)")
+    else:
+        die("сейфа нет")
+
+
+def cmd_show(args):
+    if not args:
+        die("нужен ключ")
+    data, key = load_unlocked(), args[0]
+    if key not in data:
+        near = [k for k in data if key.lower() in k.lower()]
+        if len(near) != 1:
+            die("нет такого ключа. Смотри: sec ls")
+        key = near[0]
+    e = data[key]
+    print(f"ключ:     {key}")
+    print(f"значение: {len(e['value'])} символов (в буфер: sec cp {key})")
+    print(f"источник: {e.get('source', '—')}")
+    if e.get("note"):
+        print(f"заметка:  {e['note']}")
+
+
+def cmd_get(args):
+    if not args:
+        die("нужен ключ")
+    sys.stdout.write(need(load_unlocked(), args[0]))
+    sys.stdout.flush()
+
+
+def cmd_cp(args):
+    if not args:
+        die("нужен ключ")
+    val = need(load_unlocked(), args[0])
+    for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool, input=val.encode(), check=False)
+            ok("значение в буфере обмена (на экран не выводилось)")
+            return
+    die("нет wl-copy/xclip/xsel — поставь xclip или используй sec env")
+
+
+def cmd_env(args):
+    if "--" not in args:
+        die("формат: sec env VAR=ключ [VAR2=ключ2] -- команда…")
+    i = args.index("--")
+    pairs, cmd = args[:i], args[i + 1:]
+    if not cmd:
+        die("не задана команда")
+    data, env = load_unlocked(), dict(os.environ)
+    for p in pairs:
+        if "=" not in p:
+            die(f"ожидал VAR=ключ, получил «{p}»")
+        var, key = p.split("=", 1)
+        env[var] = need(data, key)
+    sys.exit(subprocess.run(cmd, env=env).returncode)
+
+
+def cmd_ssh(args):
+    if len(args) < 2:
+        die("формат: sec ssh <ключ> user@host [аргументы ssh…]")
+    if not shutil.which("sshpass"):
+        die("нет sshpass")
+    env = dict(os.environ, SSHPASS=need(load_unlocked(), args[0]))
+    sys.exit(subprocess.run(["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=no"] + args[1:],
+                            env=env).returncode)
+
+
+def cmd_add(args):
+    if not args:
+        die("формат: sec add <ключ> [--note текст]")
+    key = args[0]
+    note = args[args.index("--note") + 1] if "--note" in args else ""
+    data, c = load_locked()
+    if key in data and "--force" not in args:
+        die(f"ключ «{key}» уже есть (перезаписать: --force)")
+    val = ask_pass(f"Значение для «{key}»")
+    data[key] = {"value": val, "source": "добавлено вручную", "note": note,
+                 "added": datetime.now().isoformat(timespec="seconds")}
+    save_locked(data, c)
+    if unlocked_alive():
+        write_private(UNLOCKED, json.dumps(data, ensure_ascii=False))
+    ok(f"добавлен «{key}» (всего {len(data)})")
+
+
+def cmd_rm(args):
+    if not args:
+        die("нужен ключ")
+    data, c = load_locked()
+    if args[0] not in data:
+        die("нет такого ключа")
+    del data[args[0]]
+    save_locked(data, c)
+    if unlocked_alive():
+        write_private(UNLOCKED, json.dumps(data, ensure_ascii=False))
+    ok(f"удалён «{args[0]}» (осталось {len(data)})")
+
+
+def cmd_rename(args):
+    if len(args) < 2:
+        die("формат: sec rename <старый> <новый>")
+    data, c = load_locked()
+    if args[0] not in data:
+        die("нет такого ключа")
+    if args[1] in data:
+        die("новое имя занято")
+    data[args[1]] = data.pop(args[0])
+    save_locked(data, c)
+    ok(f"{args[0]} → {args[1]}")
+
+
+def cmd_passwd(args):
+    """Меняем только защиту личности — сам сейф перешифровывать не нужно."""
+    c = conf_load()
+    idf = identity_to_ram(c)
+    try:
+        sk = idf.read_text().strip()
+    finally:
+        shred(idf)
+    if c["mode"] == "pass":
+        new = ask_pass("Новый мастер-пароль (4+ слова)", confirm=True, min_len=12)
+        write_private(IDENT_PASS, gpg_seal(sk.encode(), new))
+    elif c["mode"] == "usb+pin":
+        mnt = find_usb(c["usb_uuid"]) or die("флешка не воткнута")
+        new = ask_pass("Новый PIN", confirm=True)
+        write_private(mnt / (USB_REL + ".gpg"), gpg_seal(sk.encode(), new))
+    else:
+        die("в режиме «usb» пароля нет. Сменить резервный: sec passwd --recovery")
+    ok("сменено")
+
+
+def cmd_recover(args):
+    """Флешка потеряна — переходим на режим «пароль» по резервному паролю."""
+    if not IDENT_RECOVERY.exists():
+        die("резервной копии ключа нет — восстановить нечем")
+    rec = ask_pass("Резервный пароль")
+    sk = gpg_open(IDENT_RECOVERY.read_bytes(), rec)
+    new = ask_pass("Новый мастер-пароль (4+ слова)", confirm=True, min_len=12)
+    write_private(IDENT_PASS, gpg_seal(sk, new))
+    c = conf_load()
+    c["mode"] = "pass"
+    c["usb_uuid"] = None
+    conf_save(c)
+    ok("доступ восстановлен, режим переключён на «пароль»")
+    print("⚠ Старая флешка (если найдётся) всё ещё открывает сейф — сотри на ней secbox/ или пересоздай ключ.")
+
+
+def cmd_export(args):
+    if not args:
+        die("формат: sec export <файл> — кладёт ВСЕ секреты открытым текстом")
+    out = Path(args[0]).expanduser()
+    data, _ = load_locked()
+    write_private(out, json.dumps(data, ensure_ascii=False, indent=1))
+    ok(f"выгружено в {out} (0600). Удали, как только станет не нужно.")
+
+
+def cmd_sources(args):
+    data = load_unlocked()
+    files = {}
+    for k, v in data.items():
+        src = v.get("source", "")
+        if ":" in src and src.startswith("/"):
+            files.setdefault(src.rsplit(":", 1)[0], []).append(k)
+    if not files:
+        print("Источников на диске не записано.")
+        return
+    print("Эти файлы всё ещё содержат секреты открытым текстом:\n")
+    for f, keys in sorted(files.items(), key=lambda kv: -len(kv[1])):
+        gone = "" if Path(f).exists() else "  (файла уже нет)"
+        print(f"{f.replace(str(HOME), '~')}  — {len(keys)} шт.{gone}")
+    print("\nОсобое внимание: ~/.claude/CLAUDE.md читается моделью в КАЖДОЙ сессии.")
+
+
+CMDS = {"init": cmd_init, "unlock": cmd_unlock, "lock": cmd_lock, "status": cmd_status,
+        "ls": cmd_ls, "show": cmd_show, "get": cmd_get, "cp": cmd_cp, "env": cmd_env,
+        "ssh": cmd_ssh, "add": cmd_add, "rm": cmd_rm, "rename": cmd_rename,
+        "passwd": cmd_passwd, "recover": cmd_recover, "export": cmd_export,
+        "sources": cmd_sources, "_reaper": cmd_reaper}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if sys.argv[1] not in CMDS:
+        die(f"нет команды «{sys.argv[1]}». sec --help")
+    CMDS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()
